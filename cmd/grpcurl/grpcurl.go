@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -173,6 +174,11 @@ var (
 		an error to use both -authority and -servername (though this will be
 		permitted if they are both set to the same value, to increase backwards
 		compatibility with earlier releases that allowed both to be set).`))
+	spiffeID = flags.String("spiffe-id", "", prettify(`
+		If set, the server's certificate must contain a URI SAN that equals this
+		SPIFFE ID (e.g. spiffe://trust-domain/service). Requires (m)TLS. Cannot be
+		used with -insecure. Use -cacert to specify a custom trust anchor;
+		otherwise the system trust store is used.`))
 	reflection = optionalBoolFlag{val: true}
 )
 
@@ -361,6 +367,12 @@ func main() {
 	if len(altsTargetServiceAccounts) > 0 && !*usealts {
 		fail(nil, "The -alts-target-service-account argument must be used with the -alts argument.")
 	}
+	if *spiffeID != "" && !usetls {
+		fail(nil, "The -spiffe-id argument can only be used with TLS.")
+	}
+	if *spiffeID != "" && *insecure {
+		fail(nil, "The -spiffe-id argument cannot be used with -insecure.")
+	}
 	if *format != "json" && *format != "text" {
 		fail(nil, "The -format option must be 'json' or 'text'.")
 	}
@@ -509,9 +521,19 @@ func main() {
 			tlsTiming := dialTiming.Child("TLS Setup")
 			defer tlsTiming.Done()
 
-			tlsConf, err := grpcurl.ClientTLSConfig(*insecure, *cacert, *cert, *key)
-			if err != nil {
-				fail(err, "Failed to create TLS config")
+			var tlsConf *tls.Config
+			if *spiffeID != "" {
+				var err error
+				tlsConf, err = grpcurl.ClientTLSConfigForSPIFFE(*spiffeID, *cacert, *cert, *key)
+				if err != nil {
+					fail(err, "Failed to create SPIFFE TLS config")
+				}
+			} else {
+				var err error
+				tlsConf, err = grpcurl.ClientTLSConfig(*insecure, *cacert, *cert, *key)
+				if err != nil {
+					fail(err, "Failed to create TLS config")
+				}
 			}
 
 			sslKeylogFile := os.Getenv("SSLKEYLOGFILE")
