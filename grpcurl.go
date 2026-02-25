@@ -560,6 +560,83 @@ func ClientTLSConfig(insecureSkipVerify bool, cacertFile, clientCertFile, client
 	return &tlsConf, nil
 }
 
+// ClientTLSConfigForSPIFFE builds a TLS config that validates the server using SPIFFE ID
+// matching on SAN.URI instead of hostname verification.
+//
+// If cacertFile is blank, only standard trusted certs are used to verify the server certs.
+// If clientCertFile is blank, the client will not use a client certificate. If clientCertFile
+// is not blank then clientKeyFile must not be blank.
+func ClientTLSConfigForSPIFFE(expectedID, cacertFile, clientCertFile, clientKeyFile string) (*tls.Config, error) {
+	if !strings.HasPrefix(expectedID, "spiffe://") {
+		return nil, fmt.Errorf("invalid SPIFFE ID %q: must start with spiffe://", expectedID)
+	}
+
+	var tlsConf tls.Config
+
+	if clientCertFile != "" {
+		certificate, err := tls.LoadX509KeyPair(clientCertFile, clientKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("could not load client key pair: %v", err)
+		}
+		tlsConf.Certificates = []tls.Certificate{certificate}
+	}
+
+	var rootCAs *x509.CertPool // nil means use the system trust store
+	if cacertFile != "" {
+		ca, err := os.ReadFile(cacertFile)
+		if err != nil {
+			return nil, fmt.Errorf("could not read ca certificate: %v", err)
+		}
+		rootCAs = x509.NewCertPool()
+		if ok := rootCAs.AppendCertsFromPEM(ca); !ok {
+			return nil, errors.New("failed to append ca certs")
+		}
+	}
+
+	tlsConf.InsecureSkipVerify = true //nolint:gosec // Hostname check replaced by SPIFFE URI SAN check below
+	tlsConf.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return errors.New("SPIFFE verification failed: no certificates presented by server")
+		}
+
+		// Parse the leaf and any intermediates.
+		certs := make([]*x509.Certificate, len(rawCerts))
+		for i, raw := range rawCerts {
+			cert, err := x509.ParseCertificate(raw)
+			if err != nil {
+				return fmt.Errorf("SPIFFE verification failed: parse certificate: %w", err)
+			}
+			certs[i] = cert
+		}
+
+		// Build intermediates pool from everything except the leaf.
+		intermediates := x509.NewCertPool()
+		for _, c := range certs[1:] {
+			intermediates.AddCert(c)
+		}
+
+		// Verify the chain against the trusted root CAs.
+		if _, err := certs[0].Verify(x509.VerifyOptions{
+			Roots:         rootCAs,
+			Intermediates: intermediates,
+		}); err != nil {
+			return fmt.Errorf("SPIFFE verification failed: %w", err)
+		}
+
+		// Per SPIFFE spec, the leaf certificate must have exactly one URI SAN.
+		// https://github.com/spiffe/spiffe/blob/main/standards/X509-SVID.md
+		if len(certs[0].URIs) != 1 {
+			return fmt.Errorf("SPIFFE verification failed: server certificate must have exactly one URI SAN, got %d", len(certs[0].URIs))
+		}
+		if got := certs[0].URIs[0].String(); got != expectedID {
+			return fmt.Errorf("SPIFFE ID mismatch: server presented %q, expected %q", got, expectedID)
+		}
+		return nil
+	}
+
+	return &tlsConf, nil
+}
+
 // ServerTransportCredentials builds transport credentials for a gRPC server using the
 // given properties. If cacertFile is blank, the server will not request client certs
 // unless requireClientCerts is true. When requireClientCerts is false and cacertFile is
