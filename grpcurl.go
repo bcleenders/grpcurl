@@ -9,15 +9,12 @@ package grpcurl
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"net"
-	"os"
 	"regexp"
 	"slices"
+	"os"
 	"sort"
 	"strings"
 
@@ -508,102 +505,6 @@ func makeTemplate(md *desc.MessageDescriptor, path []*desc.MessageDescriptor) pr
 		}
 	}
 	return dm
-}
-
-// ClientTransportCredentials is a helper function that constructs a TLS config with
-// the given properties (see ClientTLSConfig) and then constructs and returns gRPC
-// transport credentials using that config.
-//
-// Deprecated: Use grpcurl.ClientTLSConfig and credentials.NewTLS instead.
-func ClientTransportCredentials(insecureSkipVerify bool, cacertFile, clientCertFile, clientKeyFile string) (credentials.TransportCredentials, error) {
-	tlsConf, err := ClientTLSConfig(insecureSkipVerify, cacertFile, clientCertFile, clientKeyFile)
-	if err != nil {
-		return nil, err
-	}
-
-	return credentials.NewTLS(tlsConf), nil
-}
-
-// ClientTLSConfig builds transport-layer config for a gRPC client using the
-// given properties. If cacertFile is blank, only standard trusted certs are used to
-// verify the server certs. If clientCertFile is blank, the client will not use a client
-// certificate. If clientCertFile is not blank then clientKeyFile must not be blank.
-func ClientTLSConfig(insecureSkipVerify bool, cacertFile, clientCertFile, clientKeyFile string) (*tls.Config, error) {
-	var tlsConf tls.Config
-
-	if clientCertFile != "" {
-		// Load the client certificates from disk
-		certificate, err := tls.LoadX509KeyPair(clientCertFile, clientKeyFile)
-		if err != nil {
-			return nil, fmt.Errorf("could not load client key pair: %v", err)
-		}
-		tlsConf.Certificates = []tls.Certificate{certificate}
-	}
-
-	if insecureSkipVerify {
-		tlsConf.InsecureSkipVerify = true
-	} else if cacertFile != "" {
-		// Create a certificate pool from the certificate authority
-		certPool := x509.NewCertPool()
-		ca, err := os.ReadFile(cacertFile)
-		if err != nil {
-			return nil, fmt.Errorf("could not read ca certificate: %v", err)
-		}
-
-		// Append the certificates from the CA
-		if ok := certPool.AppendCertsFromPEM(ca); !ok {
-			return nil, errors.New("failed to append ca certs")
-		}
-
-		tlsConf.RootCAs = certPool
-	}
-
-	return &tlsConf, nil
-}
-
-// ServerTransportCredentials builds transport credentials for a gRPC server using the
-// given properties. If cacertFile is blank, the server will not request client certs
-// unless requireClientCerts is true. When requireClientCerts is false and cacertFile is
-// not blank, the server will verify client certs when presented, but will not require
-// client certs. The serverCertFile and serverKeyFile must both not be blank.
-func ServerTransportCredentials(cacertFile, serverCertFile, serverKeyFile string, requireClientCerts bool) (credentials.TransportCredentials, error) {
-	var tlsConf tls.Config
-	// TODO(jh): Remove this line once https://github.com/golang/go/issues/28779 is fixed
-	// in Go tip. Until then, the recently merged TLS 1.3 support breaks the TLS tests.
-	tlsConf.MaxVersion = tls.VersionTLS12
-
-	// Load the server certificates from disk
-	certificate, err := tls.LoadX509KeyPair(serverCertFile, serverKeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("could not load key pair: %v", err)
-	}
-	tlsConf.Certificates = []tls.Certificate{certificate}
-
-	if cacertFile != "" {
-		// Create a certificate pool from the certificate authority
-		certPool := x509.NewCertPool()
-		ca, err := os.ReadFile(cacertFile)
-		if err != nil {
-			return nil, fmt.Errorf("could not read ca certificate: %v", err)
-		}
-
-		// Append the certificates from the CA
-		if ok := certPool.AppendCertsFromPEM(ca); !ok {
-			return nil, errors.New("failed to append ca certs")
-		}
-
-		tlsConf.ClientCAs = certPool
-	}
-
-	if requireClientCerts {
-		tlsConf.ClientAuth = tls.RequireAndVerifyClientCert
-	} else if cacertFile != "" {
-		tlsConf.ClientAuth = tls.VerifyClientCertIfGiven
-	} else {
-		tlsConf.ClientAuth = tls.NoClientCert
-	}
-
-	return credentials.NewTLS(&tlsConf), nil
 }
 
 // BlockingDial is a helper method to dial the given address, using optional TLS credentials,
