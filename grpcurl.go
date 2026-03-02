@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -25,6 +26,10 @@ import (
 	"github.com/jhump/protoreflect/desc" //lint:ignore SA1019 same as above
 	"github.com/jhump/protoreflect/desc/protoprint"
 	"github.com/jhump/protoreflect/dynamic" //lint:ignore SA1019 same as above
+	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
+	"github.com/spiffe/go-spiffe/v2/workloadapi"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -558,6 +563,168 @@ func ClientTLSConfig(insecureSkipVerify bool, cacertFile, clientCertFile, client
 	}
 
 	return &tlsConf, nil
+}
+
+// ClientTLSConfigForSPIFFE builds a TLS config that validates the server using SPIFFE ID
+// matching on SAN.URI instead of hostname verification.
+//
+// If cacertFile is blank, only standard trusted certs are used to verify the server certs.
+// If clientCertFile is blank, the client will not use a client certificate. If clientCertFile
+// is not blank then clientKeyFile must not be blank.
+func ClientTLSConfigForSPIFFE(expectedID, cacertFile, clientCertFile, clientKeyFile string) (*tls.Config, error) {
+	if !strings.HasPrefix(expectedID, "spiffe://") {
+		return nil, fmt.Errorf("invalid SPIFFE ID %q: must start with spiffe://", expectedID)
+	}
+
+	var tlsConf tls.Config
+
+	if clientCertFile != "" {
+		certificate, err := tls.LoadX509KeyPair(clientCertFile, clientKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("could not load client key pair: %v", err)
+		}
+		tlsConf.Certificates = []tls.Certificate{certificate}
+	}
+
+	var rootCAs *x509.CertPool // nil means use the system trust store
+	if cacertFile != "" {
+		ca, err := os.ReadFile(cacertFile)
+		if err != nil {
+			return nil, fmt.Errorf("could not read ca certificate: %v", err)
+		}
+		rootCAs = x509.NewCertPool()
+		if ok := rootCAs.AppendCertsFromPEM(ca); !ok {
+			return nil, errors.New("failed to append ca certs")
+		}
+	}
+
+	tlsConf.InsecureSkipVerify = true //nolint:gosec // Hostname check replaced by SPIFFE URI SAN check below
+	tlsConf.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return errors.New("SPIFFE verification failed: no certificates presented by server")
+		}
+
+		// Parse the leaf and any intermediates.
+		certs := make([]*x509.Certificate, len(rawCerts))
+		for i, raw := range rawCerts {
+			cert, err := x509.ParseCertificate(raw)
+			if err != nil {
+				return fmt.Errorf("SPIFFE verification failed: parse certificate: %w", err)
+			}
+			certs[i] = cert
+		}
+
+		// Build intermediates pool from everything except the leaf.
+		intermediates := x509.NewCertPool()
+		for _, c := range certs[1:] {
+			intermediates.AddCert(c)
+		}
+
+		// Verify the chain against the trusted root CAs.
+		if _, err := certs[0].Verify(x509.VerifyOptions{
+			Roots:         rootCAs,
+			Intermediates: intermediates,
+		}); err != nil {
+			return fmt.Errorf("SPIFFE verification failed: %w", err)
+		}
+
+		// Per SPIFFE spec, the leaf certificate must have exactly one URI SAN.
+		// https://github.com/spiffe/spiffe/blob/main/standards/X509-SVID.md
+		if len(certs[0].URIs) != 1 {
+			return fmt.Errorf("SPIFFE verification failed: server certificate must have exactly one URI SAN, got %d", len(certs[0].URIs))
+		}
+		if got := certs[0].URIs[0].String(); got != expectedID {
+			return fmt.Errorf("SPIFFE ID mismatch: server presented %q, expected %q", got, expectedID)
+		}
+		return nil
+	}
+
+	return &tlsConf, nil
+}
+
+// ClientTLSConfigWithSPIFFEBundle builds a TLS config that validates the server using
+// SPIFFE ID matching, with the trust anchors loaded from a SPIFFE trust bundle file.
+//
+// The bundle file may be either a single SPIFFE bundle (JWKS JSON with a top-level
+// "keys" array) or a SPIFFE Bundle Map (with a top-level "trust_domains" object), as
+// described in https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE_Trust_Domain_and_Bundle.md.
+// The trust domain is inferred from the expected SPIFFE ID (e.g. for
+// spiffe://example.org/svc, the trust domain is "example.org").
+//
+// If clientCertFile is blank, the client will not use a client certificate. If clientCertFile
+// is not blank then clientKeyFile must not be blank.
+func ClientTLSConfigWithSPIFFEBundle(expectedID, bundleFile, clientCertFile, clientKeyFile string) (*tls.Config, error) {
+	id, err := spiffeid.FromString(expectedID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid SPIFFE ID %q: %w", expectedID, err)
+	}
+
+	bundleBytes, err := os.ReadFile(bundleFile)
+	if err != nil {
+		return nil, fmt.Errorf("could not read SPIFFE bundle file: %w", err)
+	}
+
+	// Support both a single SPIFFE bundle (JWKS with top-level "keys") and a
+	// SPIFFE Bundle Map (top-level "trust_domains" object keyed by trust domain).
+	var bundleMap struct {
+		TrustDomains map[string]json.RawMessage `json:"trust_domains"`
+	}
+	if err := json.Unmarshal(bundleBytes, &bundleMap); err == nil && bundleMap.TrustDomains != nil {
+		tdName := id.TrustDomain().String()
+		tdBytes, ok := bundleMap.TrustDomains[tdName]
+		if !ok {
+			return nil, fmt.Errorf("SPIFFE bundle map does not contain an entry for trust domain %q", tdName)
+		}
+		bundleBytes = tdBytes
+	}
+
+	bundle, err := spiffebundle.Parse(id.TrustDomain(), bundleBytes)
+	if err != nil {
+		return nil, fmt.Errorf("could not load SPIFFE bundle: %w", err)
+	}
+
+	tlsConf := tlsconfig.TLSClientConfig(bundle, tlsconfig.AuthorizeID(id))
+
+	if clientCertFile != "" {
+		certificate, err := tls.LoadX509KeyPair(clientCertFile, clientKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("could not load client key pair: %w", err)
+		}
+		tlsConf.Certificates = []tls.Certificate{certificate}
+	}
+
+	return tlsConf, nil
+}
+
+// ClientTLSConfigFromWorkloadAPI builds a TLS config by fetching the client's X.509 SVID
+// and trust bundles from the SPIFFE Workload API.
+//
+// The SVID provides the client certificate and key (enabling mTLS), and the bundles
+// provide the trust anchors for validating the server certificate.
+//
+// socketPath is the gRPC address of the Workload API endpoint (e.g.
+// "unix:///run/spire/sockets/agent.sock"). If empty, the SPIFFE_ENDPOINT_SOCKET
+// environment variable is used.
+func ClientTLSConfigFromWorkloadAPI(ctx context.Context, expectedID, socketPath string) (*tls.Config, error) {
+	id, err := spiffeid.FromString(expectedID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid SPIFFE ID %q: %w", expectedID, err)
+	}
+
+	var opts []workloadapi.ClientOption
+	if socketPath != "" {
+		opts = append(opts, workloadapi.WithAddr(socketPath))
+	}
+
+	x509Ctx, err := workloadapi.FetchX509Context(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("could not fetch X.509 context from SPIFFE Workload API: %w", err)
+	}
+	if len(x509Ctx.SVIDs) == 0 {
+		return nil, errors.New("SPIFFE Workload API returned no X.509 SVIDs")
+	}
+
+	return tlsconfig.MTLSClientConfig(x509Ctx.SVIDs[0], x509Ctx.Bundles, tlsconfig.AuthorizeID(id)), nil
 }
 
 // ServerTransportCredentials builds transport credentials for a gRPC server using the
