@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -71,6 +72,25 @@ var (
 	key = flags.String("key", "", prettify(`
 		File containing client private key, to present to the server. Not valid
 		with -plaintext option. Must also provide -cert option.`))
+
+	// SPIFFE Options
+	spiffeID = flags.String("spiffe-id", "", prettify(`
+		If set, the server's certificate must contain a single URI SAN that
+		equals this SPIFFE ID (e.g. spiffe://trust-domain/service). Requires
+		(m)TLS. Use --spiffe-workload-api to fetch credentials from Workload
+		API, or --spiffe-bundle for a trust bundle, or -cacert to specify root
+		certificates`))
+	spiffeBundle = flags.String("spiffe-bundle", "", prettify(`
+		Path to a SPIFFE trust bundle file. Accepts either a single SPIFFE bundle
+		(JWKS with a top-level "keys" array) or a SPIFFE bundle map (top-level
+		"trust_domains" object). Requires -spiffe-id. Cannot be used with -cacert
+		or -spiffe-workload-api.`))
+	spiffeWorkloadAPI = flags.Bool("spiffe-workload-api", false, prettify(`
+		If set, grpcurl fetches its own X.509 SVID (client identity) and trust
+		bundles from the SPIFFE Workload API, replacing -cert/-key and
+		-cacert/-spiffe-bundle. The socket address is read from the
+		SPIFFE_ENDPOINT_SOCKET environment variable. Requires -spiffe-id. Cannot
+		be used with -cert, -key, -cacert, or -spiffe-bundle.`))
 
 	// ALTS Options
 	usealts = flags.Bool("alts", false, prettify(`
@@ -361,6 +381,30 @@ func main() {
 	if len(altsTargetServiceAccounts) > 0 && !*usealts {
 		fail(nil, "The -alts-target-service-account argument must be used with the -alts argument.")
 	}
+	if *spiffeID != "" && !usetls {
+		fail(nil, "The -spiffe-id argument can only be used with (m)TLS.")
+	}
+	if *spiffeBundle != "" && *spiffeID == "" {
+		fail(nil, "The -spiffe-bundle argument requires -spiffe-id.")
+	}
+	if *spiffeBundle != "" && *cacert != "" {
+		fail(nil, "The -spiffe-bundle and -cacert arguments are mutually exclusive.")
+	}
+	if *spiffeWorkloadAPI && *spiffeID == "" {
+		fail(nil, "The -spiffe-workload-api flag requires -spiffe-id.")
+	}
+	if *spiffeWorkloadAPI && (*cert != "" || *key != "") {
+		fail(nil, "The -spiffe-workload-api and -cert/-key arguments are mutually exclusive.")
+	}
+	if *spiffeWorkloadAPI && *cacert != "" {
+		fail(nil, "The -spiffe-workload-api and -cacert arguments are mutually exclusive.")
+	}
+	if *spiffeWorkloadAPI && *spiffeBundle != "" {
+		fail(nil, "The -spiffe-workload-api and -spiffe-bundle arguments are mutually exclusive.")
+	}
+	if *spiffeWorkloadAPI && os.Getenv("SPIFFE_ENDPOINT_SOCKET") == "" {
+		fail(nil, "The -spiffe-workload-api flag requires the SPIFFE_ENDPOINT_SOCKET environment variable to be set.")
+	}
 	if *format != "json" && *format != "text" {
 		fail(nil, "The -format option must be 'json' or 'text'.")
 	}
@@ -509,9 +553,25 @@ func main() {
 			tlsTiming := dialTiming.Child("TLS Setup")
 			defer tlsTiming.Done()
 
-			tlsConf, err := grpcurl.ClientTLSConfig(*insecure, *cacert, *cert, *key)
-			if err != nil {
-				fail(err, "Failed to create TLS config")
+			var tlsConf *tls.Config
+			if *spiffeID != "" {
+				var err error
+				if *spiffeWorkloadAPI {
+					tlsConf, err = grpcurl.ClientTLSConfigFromWorkloadAPI(ctx, *spiffeID, "")
+				} else if *spiffeBundle != "" {
+					tlsConf, err = grpcurl.ClientTLSConfigWithSPIFFEBundle(*spiffeID, *spiffeBundle, *cert, *key)
+				} else {
+					tlsConf, err = grpcurl.ClientTLSConfigForSPIFFE(*spiffeID, *cacert, *cert, *key)
+				}
+				if err != nil {
+					fail(err, "Failed to create SPIFFE TLS config")
+				}
+			} else {
+				var err error
+				tlsConf, err = grpcurl.ClientTLSConfig(*insecure, *cacert, *cert, *key)
+				if err != nil {
+					fail(err, "Failed to create TLS config")
+				}
 			}
 
 			sslKeylogFile := os.Getenv("SSLKEYLOGFILE")

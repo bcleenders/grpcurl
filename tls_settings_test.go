@@ -2,6 +2,7 @@ package grpcurl_test
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"strings"
@@ -303,6 +304,163 @@ func TestBrokenTLS_RequireClientCertButNonePresented(t *testing.T) {
 	errMsg := err.Error()
 	if !strings.Contains(errMsg, "bad certificate") && !strings.Contains(errMsg, "handshake failure") {
 		t.Fatalf("expecting a specific TLS certificate or handshake error, got: %v", err)
+	}
+}
+
+// createSPIFFETestServerAndClient starts a gRPC server using the provided TLS cert,
+// then dials it with the given client credentials.
+func createSPIFFETestServerAndClient(t *testing.T, serverCertFile, serverKeyFile string, clientCreds credentials.TransportCredentials) (*grpc.ClientConn, func()) {
+	t.Helper()
+	serverTLS, err := tls.LoadX509KeyPair(serverCertFile, serverKeyFile)
+	if err != nil {
+		t.Fatalf("load server cert: %v", err)
+	}
+	serverTLSConf := &tls.Config{
+		Certificates: []tls.Certificate{serverTLS},
+		// TLS 1.3 is fine here; we override min version only to keep parity with ServerTransportCredentials.
+		MaxVersion: tls.VersionTLS13,
+	}
+	serverCreds := credentials.NewTLS(serverTLSConf)
+	svr := grpc.NewServer(grpc.Creds(serverCreds))
+	grpcurl_testing.RegisterTestServiceServer(svr, grpcurl_testing.TestServer{})
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go svr.Serve(l) //nolint:errcheck
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	addr := fmt.Sprintf("127.0.0.1:%d", l.Addr().(*net.TCPAddr).Port)
+	cc, err := BlockingDial(ctx, "tcp", addr, clientCreds)
+	cleanup := func() {
+		if cc != nil {
+			cc.Close()
+		}
+		svr.GracefulStop()
+	}
+	if err != nil {
+		cleanup()
+		t.Fatalf("dial: %v", err)
+	}
+	return cc, cleanup
+}
+
+func TestSPIFFETLS_Valid(t *testing.T) {
+	const spiffeURI = "spiffe://example.org/myservice"
+	tlsConf, err := ClientTLSConfigForSPIFFE(spiffeURI, "internal/testing/tls/ca.crt", "", "")
+	if err != nil {
+		t.Fatalf("create SPIFFE TLS config: %v", err)
+	}
+
+	cc, cleanup := createSPIFFETestServerAndClient(t,
+		"internal/testing/tls/spiffe-server.crt",
+		"internal/testing/tls/spiffe-server.key",
+		credentials.NewTLS(tlsConf))
+	defer cleanup()
+	simpleTest(t, cc)
+}
+
+func TestSPIFFETLS_WrongID(t *testing.T) {
+	const clientExpectedURI = "spiffe://example.org/wrong"
+	// Use the same CA so chain verification passes; only the ID check should fail.
+	tlsConf, err := ClientTLSConfigForSPIFFE(clientExpectedURI, "internal/testing/tls/ca.crt", "", "")
+	if err != nil {
+		t.Fatalf("create SPIFFE TLS config: %v", err)
+	}
+
+	srvTLS, err := tls.LoadX509KeyPair("internal/testing/tls/spiffe-server.crt", "internal/testing/tls/spiffe-server.key")
+	if err != nil {
+		t.Fatalf("load server cert: %v", err)
+	}
+	svr := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{
+		Certificates: []tls.Certificate{srvTLS},
+	})))
+	grpcurl_testing.RegisterTestServiceServer(svr, grpcurl_testing.TestServer{})
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go svr.Serve(l) //nolint:errcheck
+	defer svr.GracefulStop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, dialErr := BlockingDial(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", l.Addr().(*net.TCPAddr).Port), credentials.NewTLS(tlsConf))
+	if dialErr == nil {
+		t.Fatal("expected dial to fail due to SPIFFE ID mismatch")
+	}
+	if !strings.Contains(dialErr.Error(), "SPIFFE ID mismatch") {
+		t.Fatalf("expected SPIFFE ID mismatch error, got: %v", dialErr)
+	}
+}
+
+func TestSPIFFETLS_NoURISAN(t *testing.T) {
+	// server.crt has DNS/IP SANs but no URI SAN.
+	tlsConf, err := ClientTLSConfigForSPIFFE("spiffe://example.org/myservice", "internal/testing/tls/ca.crt", "", "")
+	if err != nil {
+		t.Fatalf("create SPIFFE TLS config: %v", err)
+	}
+
+	srvTLS, err := tls.LoadX509KeyPair("internal/testing/tls/server.crt", "internal/testing/tls/server.key")
+	if err != nil {
+		t.Fatalf("load server cert: %v", err)
+	}
+	svr := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{
+		Certificates: []tls.Certificate{srvTLS},
+	})))
+	grpcurl_testing.RegisterTestServiceServer(svr, grpcurl_testing.TestServer{})
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go svr.Serve(l) //nolint:errcheck
+	defer svr.GracefulStop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, dialErr := BlockingDial(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", l.Addr().(*net.TCPAddr).Port), credentials.NewTLS(tlsConf))
+	if dialErr == nil {
+		t.Fatal("expected dial to fail because server cert has no URI SAN")
+	}
+	if !strings.Contains(dialErr.Error(), "SPIFFE verification failed") {
+		t.Fatalf("expected SPIFFE verification error, got: %v", dialErr)
+	}
+}
+
+func TestSPIFFETLS_UntrustedCA(t *testing.T) {
+	const spiffeURI = "spiffe://example.org/myservice"
+	// Client trusts wrong-ca, but spiffe-server.crt is signed by ca — chain fails.
+	tlsConf, err := ClientTLSConfigForSPIFFE(spiffeURI, "internal/testing/tls/wrong-ca.crt", "", "")
+	if err != nil {
+		t.Fatalf("create SPIFFE TLS config: %v", err)
+	}
+
+	srvTLS, err := tls.LoadX509KeyPair("internal/testing/tls/spiffe-server.crt", "internal/testing/tls/spiffe-server.key")
+	if err != nil {
+		t.Fatalf("load server cert: %v", err)
+	}
+	svr := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{
+		Certificates: []tls.Certificate{srvTLS},
+	})))
+	grpcurl_testing.RegisterTestServiceServer(svr, grpcurl_testing.TestServer{})
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go svr.Serve(l) //nolint:errcheck
+	defer svr.GracefulStop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, dialErr := BlockingDial(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", l.Addr().(*net.TCPAddr).Port), credentials.NewTLS(tlsConf))
+	if dialErr == nil {
+		t.Fatal("expected dial to fail due to untrusted CA")
+	}
+	if !strings.Contains(dialErr.Error(), "SPIFFE verification failed") {
+		t.Fatalf("expected SPIFFE verification error, got: %v", dialErr)
 	}
 }
 
