@@ -438,6 +438,13 @@ func main() {
 	if len(protoset) == 0 && len(protoFiles) == 0 && target == "" {
 		fail(nil, "No host:port specified, no protoset specified, and no proto sources specified.")
 	}
+	if strings.HasPrefix(target, "xds://") {
+		// The bootstrap env vars are captured by grpc-go at process init, so they
+		// cannot be set from within this process; they must be set before launch.
+		if os.Getenv("GRPC_XDS_BOOTSTRAP") == "" && os.Getenv("GRPC_XDS_BOOTSTRAP_CONFIG") == "" {
+			fail(nil, "xds:// targets require xDS bootstrap configuration: set the GRPC_XDS_BOOTSTRAP (or GRPC_XDS_BOOTSTRAP_CONFIG) environment variable before launching grpcurl.")
+		}
+	}
 	if len(protoset) > 0 && len(reflHeaders) > 0 {
 		warn("The -reflect-header argument is not used when -protoset files are used.")
 	}

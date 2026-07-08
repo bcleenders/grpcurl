@@ -40,6 +40,17 @@ interactive terminal and using stdin as the request body!
 numerous options for TLS configuration. It also supports mutual TLS, where the client is
 required to present a client certificate.
 
+With `xds:///` targets, the expected server identity does not need to be given on the
+command line at all: per [gRFC A29](https://github.com/grpc/proposal/blob/master/A29-xds-tls-security.md),
+the xDS control plane delivers the TLS configuration, including the accepted server
+identities (e.g. SPIFFE IDs) as SAN matchers, and certificates come from the certificate
+providers defined in the xDS bootstrap file. The bootstrap file must be specified via the
+`GRPC_XDS_BOOTSTRAP` (or `GRPC_XDS_BOOTSTRAP_CONFIG`) environment variable *before*
+launching `grpcurl` (the gRPC runtime reads it at process start):
+```shell
+GRPC_XDS_BOOTSTRAP=/path/to/bootstrap.json grpcurl xds:///my-service list
+```
+
 As mentioned above, `grpcurl` works seamlessly if the server supports the reflection
 service. If not, you can supply the `.proto` source files or you can supply protoset
 files (containing compiled descriptors, produced by `protoc`) to `grpcurl`.
