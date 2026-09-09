@@ -28,6 +28,7 @@ import (
 	"github.com/jhump/protoreflect/desc/protoprint"
 	"github.com/jhump/protoreflect/dynamic"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	xdsCredentials "google.golang.org/grpc/credentials/xds"
@@ -610,16 +611,17 @@ func ServerTransportCredentials(cacertFile, serverCertFile, serverKeyFile string
 // The network parameter should be left empty in most cases when your address is a RFC 3986
 // compliant URI. The resolver from grpc-go will resolve the correct network type.
 //
-// Dial errors that grpc-go reports as non-temporary, such as a refused
-// connection, are returned immediately rather than retried until ctx expires.
-// Temporary errors are still retried, so a connection that eventually becomes
-// ready is returned normally.
+// Except for explicit dns: targets, dial errors that grpc-go reports as
+// non-temporary, such as a refused connection, are returned immediately rather
+// than retried until ctx expires. Temporary errors are still retried.
 //
-// This uses the deprecated grpc.DialContext rather than grpc.NewClient because
-// only the former can report why a connection failed. grpc.NewClient offers no
-// equivalent of grpc.FailOnNonTempDialError, and capturing the error with a
-// custom dialer instead is not an option: grpc-go treats a dialer as an opt-out
-// of its proxy support. See https://github.com/fullstorydev/grpcurl/issues/581
+// Explicit dns: targets retain grpc.NewClient's resolver and proxy behavior:
+// the proxy resolves the hostname unless grpc.WithLocalDNSResolution is used.
+// Errors before the transport handshake are retried until ctx expires for
+// these targets. grpc.DialContext exposes those errors but forces local DNS
+// resolution, and grpc.NewClient has no equivalent of FailOnNonTempDialError.
+// A custom dialer would disable grpc-go's proxy support entirely.
+// See https://github.com/fullstorydev/grpcurl/issues/581.
 func BlockingDial(ctx context.Context, network, address string, creds credentials.TransportCredentials, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
 	if creds == nil {
 		creds = insecure.NewCredentials()
@@ -636,9 +638,10 @@ func BlockingDial(ctx context.Context, network, address string, creds credential
 		}
 	}
 
-	// grpc.Dial doesn't provide any information on permanent connection errors (like
-	// TLS handshake failures). So in order to provide good error messages, we need a
-	// custom dialer that can provide that info. That means we manage the TLS handshake.
+	// Transport credentials report handshake and read errors independently of
+	// the blocking dial. Cancel the pending dial when either path finishes.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	result := make(chan interface{}, 1)
 
 	// dialCompleted is closed once the outcome of the dial (ready connection
@@ -649,12 +652,20 @@ func BlockingDial(ctx context.Context, network, address string, creds credential
 	completeDial := func() { dialCompletedOnce.Do(func() { close(dialCompleted) }) }
 	defer completeDial()
 
+	var resultOnce sync.Once
 	writeResult := func(res interface{}) {
-		completeDial()
-		// non-blocking write: we only need the first result
-		select {
-		case result <- res:
-		default:
+		accepted := false
+		resultOnce.Do(func() {
+			completeDial()
+			result <- res
+			accepted = true
+		})
+		if !accepted {
+			// An error or cancellation may win just as the dial becomes ready.
+			// The caller will never receive this connection, so close it here.
+			if conn, ok := res.(*grpc.ClientConn); ok {
+				conn.Close()
+			}
 		}
 	}
 
@@ -670,16 +681,14 @@ func BlockingDial(ctx context.Context, network, address string, creds credential
 	case "":
 		// no-op, use address as-is
 	case "tcp":
-		if strings.HasPrefix(address, "unix://") {
+		if strings.HasPrefix(address, "unix:") {
 			return nil, fmt.Errorf("tcp network type cannot use unix address %s", address)
 		}
 	case "unix":
-		if !strings.HasPrefix(address, "unix://") {
-			// prepend unix:// to the address if it's not already there
-			// this is to maintain backwards compatibility because the custom dialer is replaced by
-			// the default dialer in grpc-go.
-			// https://github.com/fullstorydev/grpcurl/pull/480
-			address = "unix://" + address
+		if !strings.HasPrefix(address, "unix:") {
+			// unix: supports both absolute and relative paths. unix:// would
+			// parse a relative path as a URI authority instead of a socket path.
+			address = "unix:" + address
 		}
 	default:
 		// Custom dialer for networks grpc-go does not know about. Note that
@@ -709,25 +718,53 @@ func BlockingDial(ctx context.Context, network, address string, creds credential
 		// them *after* the explicitly provided options.
 		opts = append(opts, grpc.WithBlock(), grpc.WithTransportCredentials(creds))
 
-		conn, err := grpc.DialContext(ctx, address, opts...)
-		var res interface{}
-		if err != nil {
-			res = err
+		var conn *grpc.ClientConn
+		var err error
+		scheme, _, _ := strings.Cut(address, ":")
+		if strings.EqualFold(scheme, "dns") {
+			// DialContext forces local DNS resolution, breaking names that only
+			// the proxy can resolve. Keep NewClient for explicit DNS targets so
+			// caller-supplied resolvers and proxy options retain their meaning.
+			conn, err = grpc.NewClient(address, opts...)
+			if err == nil {
+				for {
+					state := conn.GetState()
+					if state == connectivity.Ready {
+						break
+					}
+					if state == connectivity.Idle {
+						conn.Connect()
+					}
+					if !conn.WaitForStateChange(ctx, state) {
+						err = ctx.Err()
+						conn.Close()
+						break
+					}
+				}
+			}
 		} else {
-			res = conn
+			conn, err = grpc.DialContext(ctx, address, opts...)
 		}
-		writeResult(res)
+		if err != nil {
+			writeResult(err)
+		} else {
+			writeResult(conn)
+		}
 	}()
 
+	var res interface{}
 	select {
-	case res := <-result:
-		if conn, ok := res.(*grpc.ClientConn); ok {
-			return conn, nil
-		}
-		return nil, res.(error)
+	case res = <-result:
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		// Publish cancellation through the same path so a racing successful
+		// dial is either returned to the caller or closed by writeResult.
+		writeResult(ctx.Err())
+		res = <-result
 	}
+	if conn, ok := res.(*grpc.ClientConn); ok {
+		return conn, nil
+	}
+	return nil, res.(error)
 }
 
 // errSignalingCreds is a wrapper around a TransportCredentials value, but

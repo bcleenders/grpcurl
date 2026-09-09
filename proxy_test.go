@@ -3,6 +3,7 @@ package grpcurl_test
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -13,8 +14,9 @@ import (
 	"time"
 
 	. "github.com/fullstorydev/grpcurl"
-	grpcurl_testing "github.com/fullstorydev/grpcurl/internal/testing"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/resolver"
+	"google.golang.org/grpc/resolver/manual"
 )
 
 // proxyChildEnv marks the re-executed child process that runs the body of
@@ -54,40 +56,98 @@ func TestProxySupport(t *testing.T) {
 		return
 	}
 
-	// Guard the premise: if this name somehow resolves (e.g. a DNS provider
-	// that wildcards NXDOMAIN), a bypassed proxy could connect directly and
-	// the test would pass for the wrong reason.
-	if addrs, err := net.LookupHost(strings.Split(proxyTarget, ":")[0]); err == nil {
-		t.Skipf("%s unexpectedly resolves to %v; cannot prove the proxy was used",
-			proxyTarget, addrs)
-	}
-
-	backend := startBackendServer(t)
+	backend := startTCPServer(t)
 	proxyAddr, connectTargets := startConnectProxy(t, backend)
 
 	// Safe to set here: this is a fresh process and nothing has dialed yet.
 	t.Setenv("HTTPS_PROXY", "http://"+proxyAddr)
+	t.Setenv("NO_PROXY", "")
+	t.Setenv("no_proxy", "")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	cc, err := BlockingDial(ctx, "", proxyTarget, nil)
-	if err != nil {
-		t.Fatalf("BlockingDial(%q) through proxy %s failed: %v\nCONNECT requests seen by proxy: %v",
-			proxyTarget, proxyAddr, err, connectTargets())
+	// WithNoProxy must dial the resolved address directly. A missing port
+	// fails locally without DNS or network access; the proxy would accept it.
+	directResolver := manual.NewBuilderWithScheme("dns")
+	directResolver.InitialState(resolver.State{Addresses: []resolver.Address{{Addr: "missing-port"}}})
+	localResolver := manual.NewBuilderWithScheme("dns")
+	const resolvedTarget = "grpcurl-resolved-proxy-test.invalid:443"
+	localResolver.InitialState(resolver.State{Addresses: []resolver.Address{{Addr: resolvedTarget}}})
+	customDialer := func(ctx context.Context, address string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", backend)
 	}
-	defer cc.Close()
 
-	simpleTest(t, cc)
+	for _, tc := range []struct {
+		name          string
+		target        string
+		opts          []grpc.DialOption
+		wantProxy     bool
+		wantError     error
+		connectTarget string
+	}{
+		{name: "bare address", target: proxyTarget, wantProxy: true},
+		{name: "dns address", target: "dns:///" + proxyTarget, wantProxy: true},
+		{
+			name:      "proxy disabled",
+			target:    "dns:///" + proxyTarget,
+			opts:      []grpc.DialOption{grpc.WithResolvers(directResolver), grpc.WithNoProxy()},
+			wantError: context.DeadlineExceeded,
+		},
+		{
+			name:          "local DNS resolution",
+			target:        "dns:///" + proxyTarget,
+			opts:          []grpc.DialOption{grpc.WithResolvers(localResolver), grpc.WithLocalDNSResolution()},
+			wantProxy:     true,
+			connectTarget: resolvedTarget,
+		},
+		{
+			name:   "custom dialer",
+			target: proxyTarget,
+			opts:   []grpc.DialOption{grpc.WithContextDialer(customDialer)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := len(connectTargets())
+			timeout := dialTimeout
+			if tc.wantError != nil {
+				timeout = time.Second
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
 
-	// The RPC succeeding is strong evidence already, but assert on the proxy's
-	// own record so a failure says plainly whether the proxy was involved.
-	seen := connectTargets()
-	if len(seen) == 0 {
-		t.Fatalf("proxy received no CONNECT requests, so the dial did not go through it")
-	}
-	if seen[0] != proxyTarget {
-		t.Errorf("proxy received CONNECT for %q, want %q", seen[0], proxyTarget)
+			cc, err := BlockingDial(ctx, "", tc.target, nil, tc.opts...)
+			if cc != nil {
+				defer cc.Close()
+			}
+			if tc.wantError != nil {
+				if !errors.Is(err, tc.wantError) {
+					t.Fatalf("BlockingDial(%q) error = %v, want %v", tc.target, err, tc.wantError)
+				}
+			} else if err != nil {
+				t.Fatalf("BlockingDial(%q) failed: %v\nCONNECT requests seen by proxy: %v",
+					tc.target, err, connectTargets()[before:])
+			} else {
+				simpleTest(t, cc)
+			}
+
+			seen := connectTargets()[before:]
+			if !tc.wantProxy {
+				if len(seen) != 0 {
+					t.Fatalf("proxy should be bypassed, got CONNECT requests: %v", seen)
+				}
+				return
+			}
+			if len(seen) == 0 {
+				t.Fatal("proxy received no CONNECT requests")
+			}
+			wantTarget := tc.connectTarget
+			if wantTarget == "" {
+				wantTarget = proxyTarget
+			}
+			for _, target := range seen {
+				if target != wantTarget {
+					t.Errorf("proxy received CONNECT for %q, want %q", target, wantTarget)
+				}
+			}
+		})
 	}
 }
 
@@ -95,26 +155,14 @@ func TestProxySupport(t *testing.T) {
 // environment has not yet been resolved and cached.
 func reExecForProxyTest(t *testing.T) {
 	t.Helper()
-	cmd := exec.Command(os.Args[0], "-test.run=^TestProxySupport$", "-test.v")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestProxySupport$", "-test.v", "-test.timeout=55s")
 	cmd.Env = append(os.Environ(), proxyChildEnv+"=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("proxy test child process failed: %v\n%s", err, out)
 	}
-}
-
-// startBackendServer starts a gRPC server on loopback and returns its address.
-func startBackendServer(t *testing.T) string {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen for backend: %v", err)
-	}
-	svr := grpc.NewServer()
-	grpcurl_testing.RegisterTestServiceServer(svr, grpcurl_testing.TestServer{})
-	go svr.Serve(l)
-	t.Cleanup(svr.Stop)
-	return l.Addr().String()
 }
 
 // startConnectProxy starts a minimal HTTP CONNECT proxy on loopback. It

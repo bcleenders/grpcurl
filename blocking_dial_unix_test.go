@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -46,6 +47,13 @@ func TestBlockingDialUnix(t *testing.T) {
 	t.Run("network=unix with bare path", func(t *testing.T) {
 		assertDialSucceeds(t, "unix", startUnixServer(t))
 	})
+	t.Run("relative paths", func(t *testing.T) {
+		path := startUnixServer(t)
+		t.Chdir(filepath.Dir(path))
+		assertDialSucceeds(t, "", "unix:"+filepath.Base(path))
+		assertDialSucceeds(t, "unix", filepath.Base(path))
+		assertDialSucceeds(t, "unix", "unix:"+filepath.Base(path))
+	})
 }
 
 func TestBlockingDialUnixSocketMissing(t *testing.T) {
@@ -53,9 +61,9 @@ func TestBlockingDialUnixSocketMissing(t *testing.T) {
 	path := tempSocketPath(t)
 
 	t.Run("network= with unix:// address", func(t *testing.T) {
-		assertFailsFast(t, "", "unix://"+path, "no such file or directory")
+		assertFailsFast(t, "", "unix://"+path, syscall.ENOENT)
 	})
 	t.Run("network=unix with bare path", func(t *testing.T) {
-		assertFailsFast(t, "unix", path, "no such file or directory")
+		assertFailsFast(t, "unix", path, syscall.ENOENT)
 	})
 }
