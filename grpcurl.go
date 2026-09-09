@@ -28,7 +28,6 @@ import (
 	"github.com/jhump/protoreflect/desc/protoprint"
 	"github.com/jhump/protoreflect/dynamic"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	xdsCredentials "google.golang.org/grpc/credentials/xds"
@@ -610,6 +609,17 @@ func ServerTransportCredentials(cacertFile, serverCertFile, serverKeyFile string
 // connection will be insecure (plain-text).
 // The network parameter should be left empty in most cases when your address is a RFC 3986
 // compliant URI. The resolver from grpc-go will resolve the correct network type.
+//
+// Dial errors that grpc-go reports as non-temporary, such as a refused
+// connection, are returned immediately rather than retried until ctx expires.
+// Temporary errors are still retried, so a connection that eventually becomes
+// ready is returned normally.
+//
+// This uses the deprecated grpc.DialContext rather than grpc.NewClient because
+// only the former can report why a connection failed. grpc.NewClient offers no
+// equivalent of grpc.FailOnNonTempDialError, and capturing the error with a
+// custom dialer instead is not an option: grpc-go treats a dialer as an opt-out
+// of its proxy support. See https://github.com/fullstorydev/grpcurl/issues/581
 func BlockingDial(ctx context.Context, network, address string, creds credentials.TransportCredentials, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
 	if creds == nil {
 		creds = insecure.NewCredentials()
@@ -656,19 +666,9 @@ func BlockingDial(ctx context.Context, network, address string, creds credential
 		dialCompleted:        dialCompleted,
 	}
 
-	// Determine the network to dial with. A custom dialer is installed below
-	// for every network type, so that connection errors (e.g. "connection
-	// refused") are propagated immediately via writeResult instead of being
-	// retried internally by gRPC until the context deadline expires.
-	// https://github.com/fullstorydev/grpcurl/issues/387
-	dialNetwork := network
 	switch network {
 	case "":
-		if strings.HasPrefix(address, "unix:") {
-			dialNetwork = "unix"
-		} else {
-			dialNetwork = "tcp"
-		}
+		// no-op, use address as-is
 	case "tcp":
 		if strings.HasPrefix(address, "unix://") {
 			return nil, fmt.Errorf("tcp network type cannot use unix address %s", address)
@@ -681,85 +681,53 @@ func BlockingDial(ctx context.Context, network, address string, creds credential
 			// https://github.com/fullstorydev/grpcurl/pull/480
 			address = "unix://" + address
 		}
-	}
-	dialer := func(ctx context.Context, addr string) (net.Conn, error) {
-		if dialNetwork == "unix" {
-			addr = unixSocketPath(addr)
+	default:
+		// Custom dialer for networks grpc-go does not know about. Note that
+		// configuring a dialer opts out of grpc-go's proxy support, which is
+		// why one is not used for the common network types.
+		// https://github.com/fullstorydev/grpcurl/pull/480
+		dialer := func(ctx context.Context, address string) (net.Conn, error) {
+			conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
+			if err != nil {
+				// capture the error so we can provide a better message
+				writeResult(err)
+			}
+			return conn, err
 		}
-		conn, err := (&net.Dialer{}).DialContext(ctx, dialNetwork, addr)
-		if err != nil {
-			// capture the error so we can provide a better message
-			writeResult(err)
-		}
-		return conn, err
-	}
-	opts = append([]grpc.DialOption{grpc.WithContextDialer(dialer)}, opts...)
-
-	// grpc.NewClient does not connect immediately, so we use conn.Connect()
-	// to trigger eager connection and then poll connectivity state to block
-	// until ready. The errSignalingCreds wrapper will capture TLS handshake
-	// errors and write them to the result channel for fail-fast behavior.
-
-	// Normalize address for NewClient which defaults to "dns" resolver.
-	// Bare host:port addresses need "passthrough:///" to preserve the old
-	// grpc.Dial behavior.
-	if !strings.Contains(address, "://") {
-		address = "passthrough:///" + address
+		opts = append([]grpc.DialOption{grpc.WithContextDialer(dialer)}, opts...)
 	}
 
-	opts = append(opts, grpc.WithTransportCredentials(creds))
-
-	conn, err := grpc.NewClient(address, opts...)
-	if err != nil {
-		return nil, err
-	}
-	conn.Connect()
-
+	// Even with grpc.FailOnNonTempDialError, this call will usually timeout in
+	// the face of TLS handshake errors. So we can't rely on grpc.WithBlock() to
+	// know when we're done. So we run it in a goroutine and then use result
+	// channel to either get the connection or fail-fast.
 	go func() {
-		for {
-			s := conn.GetState()
-			if s == connectivity.Ready {
-				writeResult(conn)
-				return
-			}
-			if s == connectivity.Shutdown {
-				return
-			}
-			if !conn.WaitForStateChange(ctx, s) {
-				// Context expired
-				return
-			}
+		// We put grpc.FailOnNonTempDialError *before* the explicitly provided
+		// options so that it could be overridden.
+		opts = append([]grpc.DialOption{grpc.FailOnNonTempDialError(true)}, opts...)
+		// But we don't want caller to be able to override these two, so we put
+		// them *after* the explicitly provided options.
+		opts = append(opts, grpc.WithBlock(), grpc.WithTransportCredentials(creds))
+
+		conn, err := grpc.DialContext(ctx, address, opts...)
+		var res interface{}
+		if err != nil {
+			res = err
+		} else {
+			res = conn
 		}
+		writeResult(res)
 	}()
 
 	select {
 	case res := <-result:
-		if c, ok := res.(*grpc.ClientConn); ok {
-			return c, nil
+		if conn, ok := res.(*grpc.ClientConn); ok {
+			return conn, nil
 		}
-		conn.Close()
 		return nil, res.(error)
 	case <-ctx.Done():
-		conn.Close()
 		return nil, ctx.Err()
 	}
-}
-
-// unixSocketPath strips the unix scheme that grpc-go re-applies to an address
-// before handing it to a custom dialer. For historical reasons, when a custom
-// dialer is configured, grpc-go passes the original dial target rather than
-// the resolved path: "unix://" for absolute paths and "unix:" for relative
-// ones. net.Dial expects a bare path, so the scheme is removed here.
-// Addresses without either prefix (such as Linux abstract sockets) are
-// returned unchanged.
-func unixSocketPath(addr string) string {
-	if path, ok := strings.CutPrefix(addr, "unix://"); ok {
-		return path
-	}
-	if path, ok := strings.CutPrefix(addr, "unix:"); ok {
-		return path
-	}
-	return addr
 }
 
 // errSignalingCreds is a wrapper around a TransportCredentials value, but
